@@ -1,0 +1,110 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUser(data) {
+      return data.displayName is string && data.displayName.size() <= 100 &&
+             data.email is string && data.email.size() <= 100 &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidPost(data) {
+      return data.authorId == request.auth.uid &&
+             data.content is string && data.content.size() <= 5000 &&
+             (data.mediaURL == null || (data.mediaURL is string && data.mediaURL.size() <= 2000)) &&
+             (data.mediaType in ['image', 'video', 'none']) &&
+             (data.likesCount is int) && (data.commentsCount is int);
+    }
+
+    function isValidComment(data) {
+      return data.authorId == request.auth.uid &&
+             data.text is string && data.text.size() <= 1000 &&
+             data.createdAt == request.time;
+    }
+
+    match /users/{userId} {
+      // Identity check: Only allow reading if user exists and they are authenticated
+      // For PII protection, we ensure 'email' isn't publicly returned if we had a more complex model, 
+      // but for MVP we allow global read of profile data (name, photo).
+      allow read: if isSignedIn();
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().createdAt == request.time;
+      allow update: if isOwner(userId) && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'bio', 'coverURL']) &&
+                      incoming().email == existing().email &&
+                      incoming().createdAt == existing().createdAt;
+    }
+
+    match /posts/{postId} {
+      // Global read for social feed
+      allow read: if isSignedIn();
+      
+      allow create: if isSignedIn() && isValidId(postId) && isValidPost(incoming()) && incoming().createdAt == request.time;
+      
+      allow update: if isSignedIn() && (
+        // Action: Engagement
+        (incoming().diff(existing()).affectedKeys().hasOnly(['likesCount', 'commentsCount'])) ||
+        // Action: Edit
+        (isOwner(existing().authorId) && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['content', 'mediaURL', 'mediaType']) &&
+         incoming().createdAt == existing().createdAt &&
+         incoming().authorId == existing().authorId)
+      ) && isValidPost(incoming());
+      
+      allow delete: if isOwner(existing().authorId);
+
+      match /likes/{userId} {
+        allow read: if isSignedIn();
+        allow write: if isOwner(userId) && isValidId(postId);
+      }
+
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && isValidComment(incoming()) && incoming().createdAt == request.time;
+        allow delete: if isOwner(existing().authorId) || isOwner(get(/databases/$(database)/documents/posts/$(postId)).data.authorId);
+      }
+    }
+
+    match /chats/{chatId} {
+      allow read: if isSignedIn() && request.auth.uid in existing().participants;
+      allow create: if isSignedIn() && request.auth.uid in incoming().participants && incoming().participants.size() == 2;
+      allow update: if isSignedIn() && request.auth.uid in existing().participants && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'lastMessageAt']);
+
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        allow create: if isSignedIn() && 
+                       request.auth.uid == incoming().senderId &&
+                       request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants &&
+                       incoming().createdAt == request.time;
+      }
+    }
+
+    match /users/{userId}/notifications/{notificationId} {
+      allow read, update: if isOwner(userId);
+      allow create: if isSignedIn(); 
+    }
+  }
+}
